@@ -77,11 +77,9 @@ static int same_endpoint(address_t a, address_t b) {
     return 0;
 }
 
-// Prefer another endpoint in the ACTIVE address family for routine rotations.
-// This still refreshes the outer 5-tuple against per-flow policing, but avoids
-// changing RTT/path characteristics every 20 seconds. Cross to the other family
-// only when no healthy same-family endpoint is available. If every alternative
-// is cooling down, keep the active flow and let a later timer/rotation retry.
+// Prefer the other address family for each hop. If it is cooling down or has
+// no usable entry, stay within the active family. If every alternative is in
+// cooldown, keep the active flow and let a later timer/rotation retry.
 static int pick_next_endpoint(address_t active, address_t &picked) {
     if (rotate_endpoint_spec_cnt == 0) return -1;
     u64_t now = get_current_time();
@@ -92,7 +90,7 @@ static int pick_next_endpoint(address_t active, address_t &picked) {
     // NB: sized by the endpoint pool cap, NOT MAX_LISTEN_SPECS — production
     // pools run 30+ specs and a 4-entry array segfaults on the first roll.
     int ports[MAX_ROTATE_ENDPOINT_SPECS];
-    vector<int> other_family;
+    vector<int> preferred;
     vector<int> same_family;
     for (int i = 0; i < rotate_endpoint_spec_cnt; i++) {
         listen_spec_t &sp = rotate_endpoint_specs[i];
@@ -107,12 +105,12 @@ static int pick_next_endpoint(address_t active, address_t &picked) {
         if (family_cooldown_until[family_slot(family)] > now) {
             continue;
         } else if (family != (int)active.get_type()) {
-            other_family.push_back(i);
+            preferred.push_back(i);
         } else {
             same_family.push_back(i);
         }
     }
-    vector<int> *pool = !same_family.empty() ? &same_family : &other_family;
+    vector<int> *pool = !preferred.empty() ? &preferred : &same_family;
     if (pool->empty()) return -1;
     int idx = (*pool)[get_true_random_number() % (u64_t)pool->size()];
     picked = rotate_endpoint_specs[idx].addr;
