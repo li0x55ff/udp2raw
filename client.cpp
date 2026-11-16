@@ -169,8 +169,8 @@ struct preconnect_t {
     int heartbeat_confirmed = 0;
     u64_t ready_time = 0;
 
-    // Active standby probes: request/response RTT plus loss since this
-    // preconnect was created. RTT uses a rolling 8-sample window.
+    // Active standby probes. RTT and completed request outcomes use independent
+    // rolling 8-sample windows; lifetime counters remain for diagnostics only.
     static const int rtt_window_cap = 8;
     u64_t probe_seq = 0;
     u64_t outstanding_seq = 0;
@@ -181,6 +181,10 @@ struct preconnect_t {
     u64_t rtt_sum = 0;
     int rtt_pos = 0;
     int rtt_samples = 0;
+    uint8_t probe_results[rtt_window_cap] = {0};
+    int probe_result_pos = 0;
+    int probe_result_count = 0;
+    int probe_window_losses = 0;
 
     void reset() {
         active = 0;
@@ -195,6 +199,9 @@ struct preconnect_t {
         rtt_sum = 0;
         rtt_pos = 0;
         rtt_samples = 0;
+        probe_result_pos = 0;
+        probe_result_count = 0;
+        probe_window_losses = 0;
 #ifdef UDP2RAW_LINUX
         client_standby_rule_del();
 #endif
@@ -218,9 +225,30 @@ static u64_t pre_avg_rtt() {
     return pre.rtt_samples > 0 ? pre.rtt_sum / (u64_t)pre.rtt_samples : 0;
 }
 
+static void pre_record_probe_result(int received) {
+    if (pre.probe_result_count == pre.rtt_window_cap) {
+        if (pre.probe_results[pre.probe_result_pos] == 0)
+            pre.probe_window_losses--;
+    } else {
+        pre.probe_result_count++;
+    }
+    pre.probe_results[pre.probe_result_pos] = received ? 1 : 0;
+    if (!received) pre.probe_window_losses++;
+    pre.probe_result_pos = (pre.probe_result_pos + 1) % pre.rtt_window_cap;
+}
+
+static u64_t pre_recent_loss_pct() {
+    return pre.probe_result_count > 0
+        ? (u64_t)pre.probe_window_losses * 100 / (u64_t)pre.probe_result_count : 0;
+}
+
 static void pre_send_probe() {
     char buf[buf_len];
     memset(buf, 0, sizeof(buf));
+    // Only one request is tracked at a time. Replacing an unanswered request
+    // resolves it as a loss; a late response with the old seq is ignored.
+    if (pre.outstanding_seq != 0)
+        pre_record_probe_result(0);
     pre.probe_seq++;
     pre.outstanding_seq = pre.probe_seq;
     pre.probe_sent_time = get_current_time();
@@ -252,6 +280,7 @@ static void pre_on_probe_response(const char *data, int data_len) {
     u64_t rtt = now - pre.probe_sent_time;
     pre.outstanding_seq = 0;
     pre.probes_received++;
+    pre_record_probe_result(1);
     if (pre.rtt_samples == pre.rtt_window_cap)
         pre.rtt_sum -= pre.rtt_window[pre.rtt_pos];
     else
@@ -262,11 +291,10 @@ static void pre_on_probe_response(const char *data, int data_len) {
     pre.heartbeat_confirmed = 1;
     mark_family_success(pre.conn.raw_family);
     if (pre.probes_received % 10 == 1) {
-        u64_t loss_pct = pre.probes_sent > 0
-            ? (pre.probes_sent - pre.probes_received) * 100 / pre.probes_sent : 0;
-        mylog(log_info, "standby probe: rtt=%llums avg=%llums loss=%llu%% (%llu/%llu responses)\n",
+        u64_t loss_pct = pre_recent_loss_pct();
+        mylog(log_info, "standby probe: rtt=%llums avg=%llums loss=%llu%% window=%d (%llu/%llu lifetime responses)\n",
               (unsigned long long)rtt, (unsigned long long)pre_avg_rtt(),
-              (unsigned long long)loss_pct,
+              (unsigned long long)loss_pct, pre.probe_result_count,
               (unsigned long long)pre.probes_received,
               (unsigned long long)pre.probes_sent);
     }
@@ -991,10 +1019,10 @@ static void swap_preconnect(conn_info_t &conn_info) {
     // With no responses, retain heartbeat-only compatibility with old servers.
     if (pre.probes_sent >= 5 && pre.probes_received > 0) {
         u64_t avg_rtt = pre_avg_rtt();
-        u64_t loss_pct = (pre.probes_sent - pre.probes_received) * 100 / pre.probes_sent;
-        mylog(log_info, "standby probe quality at swap: avg_rtt=%llums loss=%llu%% samples=%d probes=%llu/%llu\n",
+        u64_t loss_pct = pre_recent_loss_pct();
+        mylog(log_info, "standby probe quality at swap: avg_rtt=%llums loss=%llu%% samples=%d loss_window=%d probes=%llu/%llu\n",
               (unsigned long long)avg_rtt, (unsigned long long)loss_pct,
-              pre.rtt_samples,
+              pre.rtt_samples, pre.probe_result_count,
               (unsigned long long)pre.probes_received,
               (unsigned long long)pre.probes_sent);
         if (avg_rtt > 800 || loss_pct > 30) {
