@@ -1429,17 +1429,34 @@ int keep_iptables_rule()  // magic to work on a machine without grep/iptables --
     return 0;
 }
 
+// The old active INPUT-drop jump remains in place during the postconnect
+// drain window. Otherwise the kernel answers in-flight old-flow packets with
+// ICMP/RST even though udp2raw is still trying to receive and decrypt them.
+static string drain_rule_del[2];
+
+int client_drain_rule_del() {
+    char *output;
+    for (int i = 0; i < 2; i++) {
+        if (drain_rule_del[i].empty()) continue;
+        run_command(drain_rule_del[i], output, show_none);
+        run_command(drain_rule_del[i], output, show_none);
+        drain_rule_del[i].clear();
+    }
+    return 0;
+}
+
 // Move the auto-added (-a) INPUT-drop rule to a new remote port after a client
 // port rotation. Without this the kernel would see packets from the new port
-// and RST the fake connection. Deletes the old jump(s), rebuilds the pattern
-// strings (so later keep/clear passes operate on the new port), re-adds.
+// and RST the fake connection. Keep the old jump(s) until drain expiry, rebuild
+// the pattern strings (so later keep/clear passes use the new port), and re-add.
 //
-// All table mutations run as ONE sh -c per keep-slot: the ev loop is
+// All new-table mutations run as ONE sh -c per keep-slot: the ev loop is
 // single-threaded, and the previous 6 fork+execs per rotation stalled packet
 // forwarding for ~100-300ms — audible as periodic hitches at high rotation
 // rates.
 int client_rotate_iptables_rule(int new_port) {
     if (!iptables_rule_added) return 0;  // -a not in use, nothing to swap
+    client_drain_rule_del();  // no overlapping drains; remove the previous old-flow jumps
 
     char tmp_pattern[200];
     tmp_pattern[0] = 0;
@@ -1469,18 +1486,17 @@ int client_rotate_iptables_rule(int new_port) {
     char *output;
     string dummy = "";
     for (int i = 0; i <= iptables_rule_keeped; i++) {
-        // capture the OLD delete command (old pattern + old table) BEFORE
-        // rebuilding the bookkeeping for the new rule
-        string old_del = rule_keep_del[0][i];
+        // Save the OLD delete command (old pattern + old table) for drain
+        // expiry BEFORE rebuilding the bookkeeping for the new active rule.
+        drain_rule_del[i] = rule_keep_del[0][i];
 
         rule_keep[0][i] = dummy + iptables_pattern + " -j " + chain[0][i];
         rule_keep_add[0][i] = active_cmd + "-I INPUT " + rule_keep[0][i];
         rule_keep_del[0][i] = active_cmd + "-D INPUT " + rule_keep[0][i];
 
-        // one fork: delete old jump twice (ignore errors, as keep_iptables_rule
-        // does), (re)create the chain in THIS table, add the new jump
-        string batch = old_del + " 2>/dev/null; " + old_del + " 2>/dev/null; "
-                     + active_cmd + "-N " + chain[0][i] + " 2>/dev/null; "
+        // one fork: (re)create the chain in THIS table and add the new jump;
+        // the old jump is removed by client_drain_rule_del() after ~2 seconds.
+        string batch = active_cmd + "-N " + chain[0][i] + " 2>/dev/null; "
                      + active_cmd + "-F " + chain[0][i] + "; "
                      + active_cmd + "-I " + chain[0][i] + " -j DROP; "
                      + rule_keep_add[0][i];
@@ -1489,7 +1505,7 @@ int client_rotate_iptables_rule(int new_port) {
             return -1;
         }
     }
-    mylog(log_info, "rotate: iptables INPUT drop rule moved to sport %d\n", new_port);
+    mylog(log_info, "rotate: iptables INPUT drop rule moved to sport %d; old rule kept for drain\n", new_port);
     return 0;
 }
 
@@ -1673,6 +1689,7 @@ int clear_iptables_rule() {
     char *output;
     string dummy = "";
     if (!iptables_rule_added) return 0;
+    client_drain_rule_del();
 
     for (int s = 0; s < listen_spec_cnt; s++) {
         for (int i = 0; i <= iptables_rule_keeped; i++) {

@@ -139,7 +139,8 @@ extern char rotate_v6_dev[32];      // --rotate-v6-dev <wan-ifname>
 extern int rotate_stall;            // --rotate-stall <sec>: rotate if uplink <64KB over this window (0=off)
 extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destination v6 pool to rotate through
 
-int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
+int client_rotate_iptables_rule(int new_port);  // move active drop rule; keep old rule during drain
+int client_drain_rule_del();                     // remove the old active drop rule after drain expiry
 int client_standby_rule_add(const char *ip, int family, int port);  // second drop rule for a preconnect standby
 int client_standby_rule_del();                                        // remove the standby rule
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix

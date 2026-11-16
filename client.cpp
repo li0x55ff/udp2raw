@@ -351,6 +351,7 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         drain.conn.blob = nullptr;
         drain.conn.re_init();
 #ifdef UDP2RAW_LINUX
+        client_drain_rule_del();
         refresh_client_filter(conn_info);
 #endif
     }
@@ -901,17 +902,6 @@ static void swap_preconnect(conn_info_t &conn_info) {
     address_t pre_remote = pre.endpoint;
     remote_addr = pre_remote;
 
-    conn_info.my_id = pre.conn.my_id;
-    conn_info.oppsite_id = pre.conn.oppsite_id;
-    conn_info.local_const_id = pre.conn.local_const_id;
-    conn_info.raw_family = new_family;
-    memcpy(&conn_info.raw_info.send_info, &pre.conn.raw_info.send_info, sizeof(packet_info_t));
-    memcpy(&conn_info.raw_info.recv_info, &pre.conn.raw_info.recv_info, sizeof(packet_info_t));
-    conn_info.state.client_current_state = client_ready;
-    conn_info.last_hb_recv_time = get_current_time();
-    conn_info.last_hb_sent_time = 0;
-    conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
-
 #ifdef UDP2RAW_LINUX
     // Conv pre-sync: replay every active conv through the qualified standby so
     // the server pre-creates the same ids on the new connection, and carry the
@@ -930,10 +920,11 @@ static void swap_preconnect(conn_info_t &conn_info) {
     }
 #endif
 
-    // Postconnect drain: move the just-replaced flow's state into the drain
-    // slot instead of deleting it, so in-flight downlink on the old tuple is
-    // still decrypted and delivered (~1 RTT grace) instead of dropped at the
-    // narrowed filter.
+    // Postconnect drain: save the OLD flow BEFORE promoting the standby.
+    // Previously the active raw_info/ids were overwritten first, so this block
+    // accidentally saved the NEW flow. The old tuple was then absent from both
+    // the receive filter and decrypt state, guaranteeing a downlink loss burst
+    // on every swap.
     if (drain.conn.blob != nullptr) {
         delete drain.conn.blob;  // expire any previous drain (shouldn't linger)
         drain.conn.blob = nullptr;
@@ -949,6 +940,18 @@ static void swap_preconnect(conn_info_t &conn_info) {
     drain.conn.blob = conn_info.blob;  // move — NOT deleted
     drain.active = 1;
     drain.expire_time = get_current_time() + 2000;  // ~2s drain window (>= 2 RTT)
+
+    // Promote the qualified standby only after the old flow is safely drained.
+    conn_info.my_id = pre.conn.my_id;
+    conn_info.oppsite_id = pre.conn.oppsite_id;
+    conn_info.local_const_id = pre.conn.local_const_id;
+    conn_info.raw_family = new_family;
+    memcpy(&conn_info.raw_info.send_info, &pre.conn.raw_info.send_info, sizeof(packet_info_t));
+    memcpy(&conn_info.raw_info.recv_info, &pre.conn.raw_info.recv_info, sizeof(packet_info_t));
+    conn_info.state.client_current_state = client_ready;
+    conn_info.last_hb_recv_time = get_current_time();
+    conn_info.last_hb_sent_time = 0;
+    conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
 
     conn_info.blob = pre.conn.blob;
     pre.conn.blob = nullptr;
