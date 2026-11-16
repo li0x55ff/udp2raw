@@ -233,7 +233,12 @@ static void pre_send_probe() {
     int probe_len = hb_len;
     if (probe_len < (int)sizeof(probe)) probe_len = sizeof(probe);
     if (probe_len > (int)sizeof(buf)) probe_len = sizeof(buf);
-    send_safer(pre.conn, 'p', buf, probe_len);
+    int ret = send_safer(pre.conn, 'p', buf, probe_len);
+    if (pre.probes_sent == 1 || ret != 0) {
+        mylog(ret == 0 ? log_info : log_warn,
+              "standby probe request: seq=%llu bytes=%d send_ret=%d\n",
+              (unsigned long long)pre.probe_seq, probe_len, ret);
+    }
 }
 
 static void pre_on_probe_response(const char *data, int data_len) {

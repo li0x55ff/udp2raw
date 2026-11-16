@@ -96,8 +96,15 @@ int server_on_raw_recv_ready(conn_info_t &conn_info, char *ip_port, char type, c
         // Standby quality probe: echo the payload immediately so the client
         // can measure a real request/response RTT. Normal heartbeats remain
         // independent and unchanged.
+        static u64_t probe_requests = 0;
+        probe_requests++;
         conn_info.last_hb_recv_time = get_current_time();
-        send_safer(conn_info, 'q', data, data_len);
+        int ret = send_safer(conn_info, 'q', data, data_len);
+        if (probe_requests == 1 || ret != 0) {
+            mylog(ret == 0 ? log_info : log_warn,
+                  "[%s]standby probe request: bytes=%d echo_ret=%d\n",
+                  ip_port, data_len, ret);
+        }
         conn_info.last_hb_sent_time = conn_info.last_hb_recv_time;
         return 0;
     } else if (type == 'h' && data_len >= 0) {
