@@ -505,8 +505,8 @@ int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_le
     data = recv_data_buf + sizeof(anti_replay_seq_t) + sizeof(my_id_t) * 2;
     len = input_len - (sizeof(anti_replay_seq_t) + sizeof(my_id_t) * 2);
 
-    if (data[0] != 'h' && data[0] != 'd') {
-        mylog(log_debug, "first byte is not h or d  ,%x\n", data[0]);
+    if (data[0] != 'h' && data[0] != 'd' && data[0] != 'p' && data[0] != 'q') {
+        mylog(log_debug, "unsupported safer packet type %x (expected h/d/p/q)\n", data[0]);
         return -1;
     }
 
