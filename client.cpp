@@ -194,6 +194,8 @@ struct drain_t {
     int active = 0;
     conn_info_t conn;  // shallow field copies; blob is MOVED in (not copied)
     u64_t expire_time = 0;
+    u64_t data_packets = 0;
+    u64_t payload_bytes = 0;
 } drain;
 
 #ifdef UDP2RAW_LINUX
@@ -345,7 +347,8 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
     // BPF is recomputed from whatever flows remain (a standby may be live —
     // narrowing to just the active port here used to starve its heartbeats).
     if (drain.active && get_current_time() > drain.expire_time) {
-        mylog(log_info, "postconnect drain expired — old flow torn down\n");
+        mylog(log_info, "postconnect drain expired — old flow torn down after %llu data packets, %llu payload bytes\n",
+              (unsigned long long)drain.data_packets, (unsigned long long)drain.payload_bytes);
         drain.active = 0;
         delete drain.conn.blob;
         drain.conn.blob = nullptr;
@@ -939,6 +942,8 @@ static void swap_preconnect(conn_info_t &conn_info) {
     drain.conn.last_hb_sent_time = 0;
     drain.conn.blob = conn_info.blob;  // move — NOT deleted
     drain.active = 1;
+    drain.data_packets = 0;
+    drain.payload_bytes = 0;
     drain.expire_time = get_current_time() + 2000;  // ~2s drain window (>= 2 RTT)
 
     // Promote the qualified standby only after the old flow is safely drained.
@@ -1306,6 +1311,10 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                         vector<string> data_vec;
                         if (recv_safer_multi(drain.conn, type_vec, data_vec) == 0) {
                             for (int i = 0; i < (int)type_vec.size(); i++) {
+                                if (type_vec[i] == 'd') {
+                                    drain.data_packets++;
+                                    drain.payload_bytes += (u64_t)data_vec[i].length();
+                                }
                                 client_on_raw_recv_hs2_or_ready(drain.conn, type_vec[i],
                                     (char *)data_vec[i].c_str(), (int)data_vec[i].length());
                             }
