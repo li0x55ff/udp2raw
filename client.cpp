@@ -169,11 +169,32 @@ struct preconnect_t {
     int heartbeat_confirmed = 0;
     u64_t ready_time = 0;
 
+    // Active standby probes: request/response RTT plus loss since this
+    // preconnect was created. RTT uses a rolling 8-sample window.
+    static const int rtt_window_cap = 8;
+    u64_t probe_seq = 0;
+    u64_t outstanding_seq = 0;
+    u64_t probe_sent_time = 0;
+    u64_t probes_sent = 0;
+    u64_t probes_received = 0;
+    u64_t rtt_window[rtt_window_cap] = {0};
+    u64_t rtt_sum = 0;
+    int rtt_pos = 0;
+    int rtt_samples = 0;
+
     void reset() {
         active = 0;
         swap_requested = 0;
         heartbeat_confirmed = 0;
         ready_time = 0;
+        probe_seq = 0;
+        outstanding_seq = 0;
+        probe_sent_time = 0;
+        probes_sent = 0;
+        probes_received = 0;
+        rtt_sum = 0;
+        rtt_pos = 0;
+        rtt_samples = 0;
 #ifdef UDP2RAW_LINUX
         client_standby_rule_del();
 #endif
@@ -183,6 +204,68 @@ struct preconnect_t {
         conn.re_init();
     }
 } pre;
+
+// Dedicated probe request ('p') / response ('q') pair. The normal heartbeat is
+// sent independently by both peers and cannot provide an accurate RTT sample.
+struct standby_probe_t {
+    u64_t magic;
+    u64_t seq;
+    u64_t sent_ms;
+};
+static const u64_t standby_probe_magic = 0x555250524f424503ULL;  // "UPROBE\3"
+
+static u64_t pre_avg_rtt() {
+    return pre.rtt_samples > 0 ? pre.rtt_sum / (u64_t)pre.rtt_samples : 0;
+}
+
+static void pre_send_probe() {
+    char buf[buf_len];
+    memset(buf, 0, sizeof(buf));
+    pre.probe_seq++;
+    pre.outstanding_seq = pre.probe_seq;
+    pre.probe_sent_time = get_current_time();
+    pre.probes_sent++;
+    standby_probe_t probe;
+    probe.magic = standby_probe_magic;
+    probe.seq = pre.probe_seq;
+    probe.sent_ms = pre.probe_sent_time;
+    memcpy(buf, &probe, sizeof(probe));
+    int probe_len = hb_len;
+    if (probe_len < (int)sizeof(probe)) probe_len = sizeof(probe);
+    if (probe_len > (int)sizeof(buf)) probe_len = sizeof(buf);
+    send_safer(pre.conn, 'p', buf, probe_len);
+}
+
+static void pre_on_probe_response(const char *data, int data_len) {
+    if (data_len < (int)sizeof(standby_probe_t)) return;
+    standby_probe_t probe;
+    memcpy(&probe, data, sizeof(probe));
+    if (probe.magic != standby_probe_magic || probe.seq != pre.outstanding_seq
+        || pre.outstanding_seq == 0)
+        return;
+    u64_t now = get_current_time();
+    u64_t rtt = now - pre.probe_sent_time;
+    pre.outstanding_seq = 0;
+    pre.probes_received++;
+    if (pre.rtt_samples == pre.rtt_window_cap)
+        pre.rtt_sum -= pre.rtt_window[pre.rtt_pos];
+    else
+        pre.rtt_samples++;
+    pre.rtt_window[pre.rtt_pos] = rtt;
+    pre.rtt_sum += rtt;
+    pre.rtt_pos = (pre.rtt_pos + 1) % pre.rtt_window_cap;
+    pre.heartbeat_confirmed = 1;
+    mark_family_success(pre.conn.raw_family);
+    if (pre.probes_received % 10 == 1) {
+        u64_t loss_pct = pre.probes_sent > 0
+            ? (pre.probes_sent - pre.probes_received) * 100 / pre.probes_sent : 0;
+        mylog(log_info, "standby probe: rtt=%llums avg=%llums loss=%llu%% (%llu/%llu responses)\n",
+              (unsigned long long)rtt, (unsigned long long)pre_avg_rtt(),
+              (unsigned long long)loss_pct,
+              (unsigned long long)pre.probes_received,
+              (unsigned long long)pre.probes_sent);
+    }
+}
 
 //————— postconnect drain (make-before-break's other half) —————
 // After a swap, ~1 RTT of downlink is still in flight on the OLD tuple. The
@@ -392,10 +475,7 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         } else if (pc.state.client_current_state == client_ready
                    && now - pc.last_hb_sent_time >= heartbeat_interval) {
             select_client_family(pc.raw_family);
-            if (hb_mode == 0)
-                send_safer(pc, 'h', hb_buf, 0);
-            else
-                send_safer(pc, 'h', hb_buf, hb_len);
+            pre_send_probe();
             pc.last_hb_sent_time = now;
         }
     }
@@ -900,6 +980,30 @@ static void swap_preconnect(conn_info_t &conn_info) {
         return;
     }
 
+    // Quality gate: broad thresholds intentionally avoid rejecting normal
+    // cross-family RTT differences. Once the peer has answered at least one
+    // probe, reject a path with >800ms recent average RTT or >30% probe loss.
+    // With no responses, retain heartbeat-only compatibility with old servers.
+    if (pre.probes_sent >= 5 && pre.probes_received > 0) {
+        u64_t avg_rtt = pre_avg_rtt();
+        u64_t loss_pct = (pre.probes_sent - pre.probes_received) * 100 / pre.probes_sent;
+        mylog(log_info, "standby probe quality at swap: avg_rtt=%llums loss=%llu%% samples=%d probes=%llu/%llu\n",
+              (unsigned long long)avg_rtt, (unsigned long long)loss_pct,
+              pre.rtt_samples,
+              (unsigned long long)pre.probes_received,
+              (unsigned long long)pre.probes_sent);
+        if (avg_rtt > 800 || loss_pct > 30) {
+            char reason[160];
+            snprintf(reason, sizeof(reason),
+                     "standby probe quality rejected (avg_rtt=%llums loss=%llu%%)",
+                     (unsigned long long)avg_rtt, (unsigned long long)loss_pct);
+            fail_preconnect(conn_info, reason);
+            return;
+        }
+    } else if (pre.probes_sent >= 5) {
+        mylog(log_warn, "standby probe unsupported/unanswered; using heartbeat-only compatibility\n");
+    }
+
     const int new_port = pre.conn.raw_info.send_info.dst_port;
     const int new_family = pre.conn.raw_family;
     address_t pre_remote = pre.endpoint;
@@ -1281,6 +1385,9 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                                 pc.last_hb_recv_time = get_current_time();
                                 pre.heartbeat_confirmed = 1;
                                 mark_family_success(pc.raw_family);
+                            } else if (type_vec[i] == 'q') {
+                                pc.last_hb_recv_time = get_current_time();
+                                pre_on_probe_response(data_vec[i].c_str(), (int)data_vec[i].length());
                             }
                         }
                         if (pre.heartbeat_confirmed && pre.swap_requested)

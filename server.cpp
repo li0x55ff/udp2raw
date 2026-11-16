@@ -92,7 +92,15 @@ int server_on_raw_recv_ready(conn_info_t &conn_info, char *ip_port, char type, c
                     return 0;
             }*/
 
-    if (type == 'h' && data_len >= 0) {
+    if (type == 'p' && data_len >= 0) {
+        // Standby quality probe: echo the payload immediately so the client
+        // can measure a real request/response RTT. Normal heartbeats remain
+        // independent and unchanged.
+        conn_info.last_hb_recv_time = get_current_time();
+        send_safer(conn_info, 'q', data, data_len);
+        conn_info.last_hb_sent_time = conn_info.last_hb_recv_time;
+        return 0;
+    } else if (type == 'h' && data_len >= 0) {
         // u32_t tmp = ntohl(*((u32_t *) &data[sizeof(u32_t)]));
         mylog(log_debug, "[%s][hb]received hb \n", ip_port);
         conn_info.last_hb_recv_time = get_current_time();
